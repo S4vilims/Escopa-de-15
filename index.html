@@ -549,7 +549,7 @@ function menu(){
     <div class="escolhas">
       <button class="escolha" type="button" data-m="cpu"><b>Contra o computador</b><span>Você e mais 1 a 3 adversários do computador.</span></button>
       <button class="escolha" type="button" data-m="local"><b>No mesmo aparelho</b><span>2 a 4 pessoas passando o celular a cada jogada.</span></button>
-      <button class="escolha" type="button" data-m="online"><b>Online</b><span>2 a 4 pessoas, cada uma no seu celular, com um código de sala.</span></button>
+      <button class="escolha" type="button" data-m="online"><b>Online</b><span>2 a 4 pessoas, cada uma no seu celular. Com login: veja as salas abertas, crie ou entre.</span></button>
     </div>
     <div class="linhaBotoes">${emJogo?'<button class="btn sec" type="button" id="mVoltar">Voltar ao jogo</button>':''}${R?'<button class="btn sec" type="button" id="mSair">Sair da sala online</button>':''}</div>
   </div>`);
@@ -621,32 +621,55 @@ $('bMenu').onclick=menu;
 $('bRegras').onclick=regras;
 
 /* =========================================================
-   Online: um aparelho cria a sala (anfitrião) e cuida do jogo;
-   os outros mandam as jogadas e recebem o estado pelo canal ao vivo.
+   Online: login, saguão com as salas abertas e as salas.
+   Quem cria a sala (anfitrião) roda o jogo e manda o estado;
+   os outros mandam as jogadas. Tudo pelo canal ao vivo do Supabase,
+   em canais privados: só quem está logado consegue entrar.
    ========================================================= */
 const ONLINE_URL=location.origin;
+const SAGUAO='escopa15-saguao';
+let SB=null,sessao=null,saguao=null;
+const salasVistas=new Map();
 function codigoSala(){const L='ABCDEFGHJKLMNPQRSTUVWXYZ';let s='';for(let i=0;i<4;i++)s+=L[Math.floor(Math.random()*L.length)];return s;}
 function carregarScript(src){return new Promise((ok,err)=>{const s=document.createElement('script');s.src=src;s.onload=ok;s.onerror=()=>err(new Error('script'));document.head.appendChild(s);});}
-async function conectar(sala,aoReceber){
-  if(new URLSearchParams(location.search).has('teste')){ // teste: abas do mesmo navegador
-    const bc=new BroadcastChannel('escopa15-'+sala);bc.onmessage=e=>aoReceber(e.data);
-    return {enviar:m=>bc.postMessage(JSON.parse(JSON.stringify(m))),sair:()=>bc.close()};
-  }
+async function cliente(){
+  if(SB)return SB;
   const r=await fetch('/api/config',{cache:'no-store'});
   if(!r.ok)throw new Error('config');
   const {url,chave}=await r.json();
   if(!window.supabase)await carregarScript('/supabase.js');
-  const cli=window.supabase.createClient(url,chave,{auth:{persistSession:false,autoRefreshToken:false}});
-  const ch=cli.channel('escopa15-'+sala,{config:{broadcast:{self:false}}});
+  SB=window.supabase.createClient(url,chave,{auth:{persistSession:true,autoRefreshToken:true,storageKey:'escopa15-login'}});
+  const {data}=await SB.auth.getSession();sessao=data.session;
+  SB.auth.onAuthStateChange((_ev,s)=>{sessao=s;if(s)SB.realtime.setAuth(s.access_token);});
+  return SB;
+}
+const logado=()=>!!(TESTE||sessao);
+const nomeConta=()=>TESTE?(cfg.nome||'Teste '+TESTE):((sessao?.user?.user_metadata?.nome)||(sessao?.user?.email||'Jogador').split('@')[0]).slice(0,14);
+async function canal(nome,aoReceber){
+  if(TESTE){ // teste: abas do mesmo navegador
+    const bc=new BroadcastChannel(nome);bc.onmessage=e=>aoReceber(e.data);
+    return {enviar:m=>bc.postMessage(JSON.parse(JSON.stringify(m))),sair:()=>bc.close()};
+  }
+  const cli=await cliente();
+  if(!sessao)throw new Error('login');
+  await cli.realtime.setAuth(sessao.access_token);
+  const ch=cli.channel(nome,{config:{private:true,broadcast:{self:false}}});
   ch.on('broadcast',{event:'m'},({payload})=>aoReceber(payload));
   await new Promise((ok,err)=>{
     const t=setTimeout(()=>err(new Error('tempo')),12000);
-    ch.subscribe(st=>{if(st==='SUBSCRIBED'){clearTimeout(t);ok();}else if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'){clearTimeout(t);err(new Error(st));}});
+    ch.subscribe((st,e)=>{if(st==='SUBSCRIBED'){clearTimeout(t);ok();}else if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'){clearTimeout(t);err(new Error(st+(e&&e.message?': '+e.message:'')));}});
   });
   return {enviar:m=>{ch.send({type:'broadcast',event:'m',payload:m});},sair:()=>{cli.removeChannel(ch);}};
 }
+function erroConexao(e){
+  const t=String(e&&e.message||e);
+  if(t==='config')return 'O servidor do jogo não respondeu. Se você está no link do Claude, o online não funciona aí: use o site do jogo. Se está no site, faltam SUPABASE_URL e SUPABASE_ANON_KEY na Vercel.';
+  if(/CHANNEL_ERROR|nauthorized|denied/i.test(t))return 'O servidor recusou a conexão. Rode uma vez o arquivo supabase.sql no SQL Editor do Supabase (ele libera o canal para quem está logado).';
+  return 'Não consegui me conectar. Confira a internet e tente de novo.';
+}
 function sairRede(){
   if(!R)return;
+  if(R.papel==='host'&&saguao)saguao.enviar({t:'fim',sala:R.sala});
   clearInterval(R.pulso);clearInterval(R.vigia);clearInterval(R.chamar);
   try{R.sair();}catch(e){}
   R=null;$('conexao').hidden=true;
@@ -655,44 +678,120 @@ function marcarConexao(ok){
   const c=$('conexao');c.hidden=!R;if(!R)return;
   c.className='conexao'+(ok?'':' ruim');c.textContent=(ok?'● ':'○ ')+'Sala '+R.sala;
 }
+function telaConectando(t){abrir(`<div class="caixa" style="text-align:center"><h2>${esc(t)}</h2><p>Só um instante…</p></div>`);}
 
-function menuOnline(erro){
+/* ---------- login ---------- */
+async function menuOnline(erro){
+  if(!TESTE){
+    telaConectando('Conectando');
+    try{await cliente();}catch(e){abrir(`<div class="caixa"><h2>Online</h2><p class="erro">${esc(erroConexao(e))}</p><div class="linhaBotoes"><button class="btn sec" type="button" id="mV">Voltar</button></div></div>`);$('mV').onclick=menu;return;}
+    if(!sessao)return telaLogin(erro);
+    meuId=sessao.user.id;
+  }
+  telaSaguao(erro);
+}
+function telaLogin(erro,aviso){
+  abrir(`<form class="caixa" id="f" role="dialog" aria-modal="true">
+    <button class="voltar" type="button" id="mV">← voltar</button>
+    <h2>Entrar para jogar online</h2>
+    <p>Só quem tem login entra nas salas.</p>
+    ${erro?`<p class="erro">${esc(erro)}</p>`:''}${aviso?`<p style="color:var(--ok)">${esc(aviso)}</p>`:''}
+    <p class="rotulo">E-mail</p>
+    <input class="campo" id="lEmail" type="email" required autocomplete="email" inputmode="email">
+    <p class="rotulo">Senha</p>
+    <input class="campo" id="lSenha" type="password" required minlength="6" autocomplete="current-password">
+    <div class="linhaBotoes"><button class="btn" type="submit">Entrar</button></div>
+    <h3>Primeira vez?</h3>
+    <p style="margin-top:0">Preencha e-mail e senha acima (mínimo 6 letras ou números), escreva seu nome e toque em Criar conta.</p>
+    <input class="campo" id="lNome" maxlength="14" placeholder="Seu nome no jogo" autocomplete="nickname">
+    <div class="linhaBotoes"><button class="btn sec" type="button" id="bCriarConta">Criar conta</button></div>
+  </form>`);
+  $('mV').onclick=menu;
+  const dados=()=>{const email=$('lEmail').value.trim(),senha=$('lSenha').value;if(!email){$('lEmail').focus();return null;}if(senha.length<6){$('lSenha').focus();return null;}return {email,senha};};
+  const traduz=m=>/Invalid login/i.test(m)?'E-mail ou senha errados.':/not confirmed/i.test(m)?'Falta confirmar o e-mail: abra a mensagem que o Supabase mandou e clique no link.':/already registered|already been registered/i.test(m)?'Esse e-mail já tem conta. Use Entrar.':/rate limit/i.test(m)?'Muitas tentativas. Espere alguns minutos.':/Signups not allowed|disabled/i.test(m)?'Criar conta está desligado. Peça para o dono do jogo criar a sua.':m;
+  $('f').onsubmit=async e=>{
+    e.preventDefault();const d=dados();if(!d)return;
+    const {error}=await SB.auth.signInWithPassword({email:d.email,password:d.senha});
+    if(error)return telaLogin(traduz(error.message));
+    const {data}=await SB.auth.getSession();sessao=data.session;menuOnline();
+  };
+  $('bCriarConta').onclick=async()=>{
+    const d=dados();if(!d)return;const nome=$('lNome').value.trim();if(!nome){$('lNome').focus();return;}
+    const {data,error}=await SB.auth.signUp({email:d.email,password:d.senha,options:{data:{nome}}});
+    if(error)return telaLogin(traduz(error.message));
+    if(data.session){sessao=data.session;menuOnline();}
+    else telaLogin('', 'Conta criada. Abra o e-mail de confirmação, clique no link e depois volte aqui para entrar.');
+  };
+}
+
+/* ---------- saguão: lista das salas abertas ---------- */
+async function abrirSaguao(){
+  if(saguao)return saguao;
+  saguao=await canal(SAGUAO,msgSaguao);
+  saguao.enviar({t:'quem'});
+  return saguao;
+}
+function msgSaguao(m){
+  if(!m||typeof m!=='object')return;
+  if(m.t==='sala'&&m.info&&/^[A-Z]{4}$/.test(m.info.sala)){salasVistas.set(m.info.sala,{...m.info,visto:Date.now()});desenharSalas();}
+  else if(m.t==='fim'){salasVistas.delete(m.sala);desenharSalas();}
+  else if(m.t==='quem'&&R&&R.papel==='host')anunciarSala();
+}
+function infoSala(){
+  const L=R.lobby;
+  return {sala:R.sala,anfitriao:L.jogadores[0].nome,n:L.n,ocupados:E?E.tipos.filter(t=>t!=='cpu').length:L.jogadores.length,duplas:L.duplas,alvo:L.alvo,obrig:L.obrig,jogando:!!E,ids:E?E.ids:L.jogadores.map(j=>j.id)};
+}
+function anunciarSala(){if(R&&R.papel==='host'&&saguao)saguao.enviar({t:'sala',info:infoSala()});}
+function desenharSalas(){
+  const caixa=$('listaSalas');if(!caixa)return;
+  const agora=Date.now();
+  for(const [k,v] of salasVistas)if(agora-v.visto>10000)salasVistas.delete(k);
+  const salas=[...salasVistas.values()].sort((a,b)=>a.jogando-b.jogando||a.sala.localeCompare(b.sala));
+  if(!salas.length){caixa.innerHTML='<li class="livre"><span>Nenhuma sala aberta agora. Crie uma abaixo.</span></li>';return;}
+  caixa.innerHTML=salas.map(s=>{
+    const minha=(s.ids||[]).includes(meuId);
+    const pode=minha||(!s.jogando&&s.ocupados<s.n);
+    const det=`${s.ocupados} de ${s.n} · até ${s.alvo}${s.duplas?' · duplas':''}${s.jogando?' · em jogo':''}`;
+    return `<li><span>Sala ${s.sala} de ${esc(s.anfitriao)}<br><small>${det}</small></span>${pode?`<button class="btn" type="button" data-sala="${s.sala}">${minha&&s.jogando?'Voltar':'Entrar'}</button>`:'<small>cheia</small>'}</li>`;
+  }).join('');
+  caixa.querySelectorAll('[data-sala]').forEach(b=>b.onclick=()=>entrarSala(b.dataset.sala,nomeConta()));
+}
+async function telaSaguao(erro){
   const salaUrl=(new URLSearchParams(location.search).get('sala')||'').toUpperCase().slice(0,4);
   abrir(`<form class="caixa" id="f" role="dialog" aria-modal="true">
     <button class="voltar" type="button" id="mV">← voltar</button>
-    <h2>Online</h2>
-    <p>Cada pessoa joga no seu celular. Uma cria a sala e manda o código para as outras.</p>
+    <h2>Salas online</h2>
+    <p>Você está como <b style="color:var(--texto)">${esc(nomeConta())}</b>.${TESTE?'':' <button class="voltar" type="button" id="bSairConta" style="margin:0;text-decoration:underline">Sair da conta</button>'}</p>
     ${erro?`<p class="erro">${esc(erro)}</p>`:''}
-    <p class="rotulo">Seu nome</p>
-    <input class="campo" name="nome" maxlength="14" required value="${esc(cfg.nome)}" placeholder="Como os outros vão te ver" autocomplete="nickname">
-    <h3>Entrar numa sala</h3>
-    <div class="link"><input class="campo codigo" name="codigo" maxlength="4" value="${esc(salaUrl)}" placeholder="ABCD" autocomplete="off" aria-label="Código da sala"><button class="btn" type="button" id="bEntrar">Entrar</button></div>
-    <h3>Ou criar uma sala nova</h3>
+    <p class="rotulo">Salas abertas agora</p>
+    <ul class="assentos" id="listaSalas"><li class="livre"><span>Procurando salas…</span></li></ul>
+    <h3>Criar sala nova</h3>
     <p class="rotulo">Jogadores</p>
     <div class="seg">${radio('n',2,'2',cfg.n)}${radio('n',3,'3',cfg.n)}${radio('n',4,'4',cfg.n)}</div>
     ${opcoesComuns()}
-    <div class="linhaBotoes"><button class="btn sec" type="submit">Criar sala</button></div>
+    <div class="linhaBotoes"><button class="btn" type="submit">Criar sala e entrar</button></div>
+    <h3>Tem um código?</h3>
+    <div class="link"><input class="campo codigo" name="codigo" maxlength="4" value="${esc(salaUrl)}" placeholder="ABCD" autocomplete="off" aria-label="Código da sala"><button class="btn sec" type="button" id="bEntrar">Entrar</button></div>
   </form>`);
   const f=$('f');ligarDuplas(f);$('mV').onclick=menu;
-  const nome=()=>{const v=f.nome.value.trim();if(!v){f.nome.focus();return null;}cfg.nome=v;salvarCfg();return v;};
-  $('bEntrar').onclick=()=>{const n=nome();if(!n)return;const c=f.codigo.value.trim().toUpperCase();if(c.length!==4){f.codigo.focus();return;}entrarSala(c,n);};
-  f.onsubmit=e=>{e.preventDefault();const n=nome();if(!n)return;lerComuns(f);cfg.n=+f.n.value;salvarCfg();criarSala(n);};
-  if(salaUrl&&cfg.nome)setTimeout(()=>$('bEntrar').focus(),0);
+  if($('bSairConta'))$('bSairConta').onclick=async()=>{sairRede();if(saguao){saguao.sair();saguao=null;}await SB.auth.signOut();sessao=null;telaLogin();};
+  $('bEntrar').onclick=()=>{const c=f.codigo.value.trim().toUpperCase();if(!/^[A-Z]{4}$/.test(c)){f.codigo.focus();return;}entrarSala(c,nomeConta());};
+  f.onsubmit=e=>{e.preventDefault();lerComuns(f);cfg.n=+f.n.value;salvarCfg();criarSala(nomeConta());};
+  try{await abrirSaguao();}catch(e){const c=$('listaSalas');if(c)c.innerHTML=`<li class="livre"><span class="erro">${esc(erroConexao(e))}</span></li>`;return;}
+  desenharSalas();
+  const t=setInterval(()=>{if(!$('listaSalas')){clearInterval(t);return;}desenharSalas();},3000);
 }
-function avisoForaDoSite(){
-  return `Não consegui me conectar ao servidor do jogo. Confira a internet e tente de novo. (Se você está no link do Claude, o online não funciona aí: use o site do jogo.)`;
-}
-function telaConectando(t){abrir(`<div class="caixa" style="text-align:center"><h2>${esc(t)}</h2><p>Só um instante…</p></div>`);}
 
+/* ---------- sala ---------- */
 async function criarSala(nome){
   sairRede();clearTimeout(tCPU);tCPU=null;E=null;
   const sala=codigoSala();
   telaConectando('Criando a sala');
-  try{R=await conectar(sala,msgAnfitriao);}catch(e){menuOnline(avisoForaDoSite());return;}
+  try{await abrirSaguao();R=await canal('escopa15-'+sala,msgAnfitriao);}catch(e){menuOnline(erroConexao(e));return;}
   Object.assign(R,{papel:'host',sala,lobby:{jogadores:[{id:meuId,nome}],n:cfg.n,duplas:cfg.duplas&&cfg.n===4,alvo:cfg.alvo,obrig:cfg.obrig}});
   modo='online';eu=0;
-  R.pulso=setInterval(()=>{if(!R)return;if(E)R.enviar({t:'estado',E});else R.enviar({t:'lobby',sala,lobby:R.lobby});},4000);
-  marcarConexao(true);telaLobby();
+  R.pulso=setInterval(()=>{if(!R)return;if(E)R.enviar({t:'estado',E});else R.enviar({t:'lobby',sala,lobby:R.lobby});anunciarSala();},3000);
+  anunciarSala();marcarConexao(true);telaLobby();
 }
 function msgAnfitriao(m){
   if(!R||!m||typeof m!=='object')return;
@@ -703,12 +802,12 @@ function msgAnfitriao(m){
     }
     const L=R.lobby,ja=L.jogadores.find(j=>j.id===m.id);
     if(ja)ja.nome=String(m.nome||'').slice(0,14)||ja.nome;
-    else if(L.jogadores.length<L.n)L.jogadores.push({id:String(m.id).slice(0,20),nome:String(m.nome||'Jogador').slice(0,14)});
+    else if(L.jogadores.length<L.n)L.jogadores.push({id:String(m.id).slice(0,40),nome:String(m.nome||'Jogador').slice(0,14)});
     else{R.enviar({t:'cheia',para:m.id});return;}
-    R.enviar({t:'lobby',sala:R.sala,lobby:L});telaLobby();
+    R.enviar({t:'lobby',sala:R.sala,lobby:L});anunciarSala();telaLobby();
   }else if(m.t==='sair'&&!E){
     R.lobby.jogadores=R.lobby.jogadores.filter(j=>j.id!==m.id||j.id===meuId);
-    R.enviar({t:'lobby',sala:R.sala,lobby:R.lobby});telaLobby();
+    R.enviar({t:'lobby',sala:R.sala,lobby:R.lobby});anunciarSala();telaLobby();
   }else if(m.t==='jogada'&&E){
     if(E.ids[m.s]!==m.id||!Array.isArray(m.ids))return;
     if(!executar(m.s,String(m.c),m.ids.map(String)))R.enviar({t:'estado',E}); // jogada inválida: reenvia o estado
@@ -726,7 +825,7 @@ function comecarOnline(){
   }
   E=criarJogo({nomes,tipos,ids,duplas:L.duplas,alvo:L.alvo,obrig:L.obrig});
   ui={sel:null,selMesa:new Set(),seq:-1,resumoVisto:-1,passeVisto:null,esperando:false};
-  $('camada').innerHTML='';mudou();
+  $('camada').innerHTML='';mudou();anunciarSala();
 }
 function telaLobby(){
   if(!R||E)return;
@@ -742,7 +841,7 @@ function telaLobby(){
   abrir(`<div class="caixa" role="dialog" aria-modal="true">
     <p class="rotulo">Sala online</p>
     <div class="sala">${R.sala}</div>
-    <p style="text-align:center">Mande o código ou o link para quem vai jogar. Partida até ${L.alvo}${L.duplas?', em duplas':''}${L.obrig?', captura obrigatória':''}.</p>
+    <p style="text-align:center">A sala aparece na lista de quem estiver logado. Também dá para mandar o link. Partida até ${L.alvo}${L.duplas?', em duplas':''}${L.obrig?', captura obrigatória':''}.</p>
     <div class="link"><code>${esc(link)}</code><button class="btn sec" type="button" id="bCopiar">Copiar</button></div>
     <p class="rotulo">Jogadores (${L.jogadores.length} de ${L.n})</p>
     <ul class="assentos">${lista}</ul>
@@ -759,7 +858,7 @@ function telaLobby(){
 async function entrarSala(sala,nome){
   sairRede();clearTimeout(tCPU);tCPU=null;E=null;
   telaConectando('Entrando na sala '+sala);
-  try{R=await conectar(sala,msgConvidado);}catch(e){menuOnline(avisoForaDoSite());return;}
+  try{R=await canal('escopa15-'+sala,msgConvidado);}catch(e){menuOnline(erroConexao(e));return;}
   Object.assign(R,{papel:'convidado',sala,lobby:null,ultimo:Date.now(),achou:false});
   modo='online';
   const oi=()=>R&&R.enviar({t:'oi',id:meuId,nome});
