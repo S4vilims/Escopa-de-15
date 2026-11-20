@@ -1,0 +1,31 @@
+{
+  "name": "Escopa de 15",
+  "short_name": "Escopa 15",
+  "description": "Jogo de cartas Escopa de 15: contra o computador, passando o celular ou online com até 4 pessoas.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#073528",
+  "theme_color": "#073528",
+  "lang": "pt-BR",
+  "icons": [
+    {
+      "src": "/icone-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icone-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icone-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
